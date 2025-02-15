@@ -2,6 +2,8 @@ package main
 
 import (
 	"archive/zip"
+	"bytes"
+	"crypto/sha256"
 	"flag"
 	"fmt"
 	"io"
@@ -18,15 +20,29 @@ var maxWorkers int
 var autoMode bool
 var dryRun bool
 var basePath string
+var logFile string
 
 const maxRetries = 3
 const assumedExtractionSpeed = 100 * 1024 * 1024 // 100MB/s extraction speed assumption
+const hashThreshold = 10 * 1024 * 1024           // Only hash files smaller than 10MB
 
 func init() {
 	flag.IntVar(&maxWorkers, "workers", 4, "Number of parallel extraction workers")
 	flag.BoolVar(&autoMode, "auto", false, "Skip confirmation and auto-start extraction")
 	flag.BoolVar(&dryRun, "dry-run", false, "Show extraction details without performing extraction")
 	flag.StringVar(&basePath, "base-path", "", "Base path within the ZIP file to start extraction from")
+	flag.StringVar(&logFile, "log", "", "Path to write extraction logs")
+}
+
+// ExtractionLog represents a single file extraction attempt
+type ExtractionLog struct {
+	Path      string    // Path within the zip
+	DestPath  string    // Destination path on disk
+	Size      int64     // File size
+	Status    string    // "Extracted", "Skipped", "Failed"
+	Reason    string    // Why it was skipped/failed, or empty for success
+	Timestamp time.Time // When the extraction was attempted
+	DryRun    bool      // Whether this was a dry run
 }
 
 type ZipExtractor struct {
@@ -35,6 +51,7 @@ type ZipExtractor struct {
 	dryRun     bool
 	destFolder string
 	basePath   string
+	logs       []ExtractionLog
 }
 
 func NewZipExtractor(workers int, autoMode bool, dryRun bool, destFolder string, basePath string) *ZipExtractor {
@@ -70,6 +87,85 @@ type ZipSummary struct {
 	TotalFiles       int
 	AlreadyExtracted int
 	EstimatedTime    Duration
+}
+
+// FileInfo holds metadata about a file
+type FileInfo struct {
+	Size    int64
+	ModTime time.Time
+	Mode    os.FileMode
+}
+
+// GetFileInfo returns size, modification time and mode of a file
+func GetFileInfo(path string) (*FileInfo, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, err
+	}
+	if info.IsDir() {
+		return nil, fmt.Errorf("path is a directory")
+	}
+	return &FileInfo{
+		Size:    info.Size(),
+		ModTime: info.ModTime(),
+		Mode:    info.Mode(),
+	}, nil
+}
+
+// IsFileEqual checks if a file at destPath matches the expected zip file entry
+func IsFileEqual(f *zip.File, destPath string) (bool, string) {
+	destInfo, err := GetFileInfo(destPath)
+	if err != nil {
+		return false, fmt.Sprintf("error accessing file: %v", err)
+	}
+
+	if destInfo.Size != int64(f.UncompressedSize64) {
+		return false, fmt.Sprintf("size mismatch: zip=%d, existing=%d", f.UncompressedSize64, destInfo.Size)
+	}
+
+	timeDiff := destInfo.ModTime.Sub(f.Modified).Abs()
+	if timeDiff > 2*time.Second {
+		return false, fmt.Sprintf("time mismatch: zip=%v, existing=%v", f.Modified, destInfo.ModTime)
+	}
+
+	if destInfo.Size < hashThreshold {
+		equal, err := compareFileHash(f, destPath)
+		if err != nil {
+			return false, fmt.Sprintf("hash comparison error: %v", err)
+		}
+		if !equal {
+			return false, "content mismatch (different hash)"
+		}
+	}
+
+	return true, ""
+}
+
+func compareFileHash(f *zip.File, destPath string) (bool, error) {
+	h1 := sha256.New()
+	h2 := sha256.New()
+
+	// Hash zip file content
+	rc, err := f.Open()
+	if err != nil {
+		return false, err
+	}
+	defer rc.Close()
+	if _, err := io.Copy(h1, rc); err != nil {
+		return false, err
+	}
+
+	// Hash existing file
+	file, err := os.Open(destPath)
+	if err != nil {
+		return false, err
+	}
+	defer file.Close()
+	if _, err := io.Copy(h2, file); err != nil {
+		return false, err
+	}
+
+	return bytes.Equal(h1.Sum(nil), h2.Sum(nil)), nil
 }
 
 func FileExists(path string) bool {
@@ -134,6 +230,17 @@ func (z *ZipExtractor) Unzip(zipPath string) error {
 
 	if z.dryRun {
 		fmt.Printf("DRY RUN - Would extract %d files\n", len(r.File))
+		for _, f := range r.File {
+			relPath, include := z.shouldIncludeFile(f.Name)
+			if !include {
+				continue
+			}
+			destPath := filepath.Join(z.destFolder, relPath)
+			if f.FileInfo().IsDir() {
+				continue
+			}
+			z.ExtractFile(f, destPath)
+		}
 		return nil
 	}
 
@@ -170,7 +277,7 @@ func (z *ZipExtractor) Unzip(zipPath string) error {
 		go func(f *zip.File, destPath string) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			if err := ExtractFile(f, destPath); err != nil {
+			if err := z.ExtractFile(f, destPath); err != nil {
 				errMutex.Lock()
 				extractionErrors = append(extractionErrors, fmt.Errorf("error extracting %s: %w", destPath, err))
 				errMutex.Unlock()
@@ -188,21 +295,61 @@ func (z *ZipExtractor) Unzip(zipPath string) error {
 	return nil
 }
 
-func ExtractFile(f *zip.File, destPath string) error {
-	if FileExists(destPath) {
-		destInfo, _ := os.Stat(destPath)
-		if destInfo.Size() == int64(f.UncompressedSize64) {
+func (z *ZipExtractor) logExtraction(path, destPath string, size int64, status, reason string) {
+	z.logs = append(z.logs, ExtractionLog{
+		Path:      path,
+		DestPath:  destPath,
+		Size:      size,
+		Status:    status,
+		Reason:    reason,
+		Timestamp: time.Now(),
+		DryRun:    z.dryRun,
+	})
+}
+
+func (z *ZipExtractor) GetLogs() []ExtractionLog {
+	return z.logs
+}
+
+func (z *ZipExtractor) ExtractFile(f *zip.File, destPath string) error {
+	if z.dryRun {
+		equal, reason := IsFileEqual(f, destPath)
+		if equal {
+			z.logExtraction(f.Name, destPath, int64(f.UncompressedSize64), "Skipped", "File already exists and matches")
 			return nil
 		}
+		var extractReason string
+		if FileExists(destPath) {
+			extractReason = fmt.Sprintf("File exists but %s", reason)
+		} else {
+			extractReason = "File does not exist"
+		}
+		z.logExtraction(f.Name, destPath, int64(f.UncompressedSize64), "Would Extract", extractReason)
+		return nil
+	}
+
+	equal, reason := IsFileEqual(f, destPath)
+	if equal {
+		z.logExtraction(f.Name, destPath, int64(f.UncompressedSize64), "Skipped", "File already exists and matches")
+		return nil
+	}
+	if FileExists(destPath) {
+		z.logExtraction(f.Name, destPath, int64(f.UncompressedSize64), "Replacing", reason)
 	}
 
 	for attempt := 1; attempt <= maxRetries; attempt++ {
 		err := ExtractAndVerify(f, destPath)
 		if err == nil {
+			z.logExtraction(f.Name, destPath, int64(f.UncompressedSize64), "Extracted", "")
 			return nil
 		}
-		fmt.Printf("Retrying extraction (%d/%d) for: %s\n", attempt, maxRetries, destPath)
-		time.Sleep(time.Second * 2)
+		if attempt < maxRetries {
+			z.logExtraction(f.Name, destPath, int64(f.UncompressedSize64), "Retry",
+				fmt.Sprintf("Attempt %d/%d failed: %v", attempt, maxRetries, err))
+		} else {
+			z.logExtraction(f.Name, destPath, int64(f.UncompressedSize64), "Failed",
+				fmt.Sprintf("All %d attempts failed: %v", maxRetries, err))
+		}
 	}
 	return fmt.Errorf("failed after %d attempts: %s", maxRetries, destPath)
 }
@@ -241,6 +388,39 @@ func ExtractAndVerify(f *zip.File, destPath string) error {
 	return nil
 }
 
+func writeLogsToFile(logs []ExtractionLog, path string) error {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		return fmt.Errorf("failed to open log file: %w", err)
+	}
+	defer f.Close()
+
+	// Write header if file is empty
+	info, err := f.Stat()
+	if err != nil {
+		return fmt.Errorf("failed to stat log file: %w", err)
+	}
+	if info.Size() == 0 {
+		fmt.Fprintln(f, "Timestamp,Path,DestPath,Size,Status,Reason,DryRun")
+	}
+
+	// Write logs in CSV format
+	for _, log := range logs {
+		_, err := fmt.Fprintf(f, "%s,%s,%s,%d,%s,%q,%v\n",
+			log.Timestamp.Format(time.RFC3339),
+			log.Path,
+			log.DestPath,
+			log.Size,
+			log.Status,
+			log.Reason,
+			log.DryRun)
+		if err != nil {
+			return fmt.Errorf("failed to write log: %w", err)
+		}
+	}
+	return nil
+}
+
 func main() {
 	flag.Parse()
 	args := flag.Args()
@@ -253,6 +433,7 @@ func main() {
 		fmt.Println("  --auto                      Skip confirmation and auto-start extraction")
 		fmt.Println("  --dry-run                   Show extraction details without performing extraction")
 		fmt.Println("  --base-path=\"PATH\"          Base path within the ZIP file to start extraction from")
+		fmt.Println("  --log=\"PATH\"                Path to write extraction logs")
 		os.Exit(1)
 	}
 
@@ -264,6 +445,10 @@ func main() {
 			fmt.Println("Error creating destination folder:", err)
 			os.Exit(1)
 		}
+	}
+
+	if dryRun {
+		fmt.Println("DRY RUN!")
 	}
 
 	extractor := NewZipExtractor(maxWorkers, autoMode, dryRun, destFolder, basePath)
@@ -326,8 +511,49 @@ func main() {
 	}
 
 	for _, zipFile := range confirmedZips {
-		extractor.Unzip(zipFile)
+		err := extractor.Unzip(zipFile)
+		if err != nil {
+			fmt.Printf("Error processing %s: %v\n", zipFile, err)
+			continue
+		}
+
+		// Print extraction summary with dry run indicator
+		if dryRun {
+			fmt.Printf("\n🔍 DRY RUN - Extraction Log for %s:\n", zipFile)
+		} else {
+			fmt.Printf("\nExtraction Log for %s:\n", zipFile)
+		}
+		fmt.Println("----------------------------------------")
+		for _, log := range extractor.GetLogs() {
+			prefix := ""
+			if log.DryRun {
+				prefix = "[DRY RUN] "
+			}
+
+			switch log.Status {
+			case "Extracted":
+				fmt.Printf("%s✅ %s -> %s (%.2f MB)\n", prefix, log.Path, log.DestPath, float64(log.Size)/(1024*1024))
+			case "Skipped":
+				fmt.Printf("%s⏭️  %s: %s\n", prefix, log.Path, log.Reason)
+			case "Failed":
+				fmt.Printf("%s❌ %s: %s\n", prefix, log.Path, log.Reason)
+			case "Would Extract":
+				fmt.Printf("%s🔍 %s -> %s (%.2f MB)\n", prefix, log.Path, log.DestPath, float64(log.Size)/(1024*1024))
+			}
+		}
+		fmt.Println("----------------------------------------")
+
+		// Write logs to file if requested
+		if logFile != "" {
+			if err := writeLogsToFile(extractor.GetLogs(), logFile); err != nil {
+				fmt.Printf("Warning: Failed to write logs to file: %v\n", err)
+			}
+		}
 	}
 
-	fmt.Println("\n✅ All confirmed ZIP files processed successfully.")
+	if dryRun {
+		fmt.Println("\n🔍 DRY RUN completed - no files were modified.")
+	} else {
+		fmt.Println("\n✅ All confirmed ZIP files processed successfully.")
+	}
 }
