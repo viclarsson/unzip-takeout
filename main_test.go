@@ -950,26 +950,45 @@ func TestLargeFileHandling(t *testing.T) {
 	tests := []struct {
 		name     string
 		size     int64
-		modify   bool // whether to modify the extracted file
-		wantHash bool // whether hash comparison should occur
+		modifyFn func(string) error // function to modify the file
+		want     bool               // expected IsFileEqual result
 	}{
 		{
-			name:     "just under threshold",
-			size:     hashThreshold - 1024, // 1KB under threshold
-			modify:   true,
-			wantHash: true, // Should perform hash check
+			name: "just under threshold",
+			size: hashThreshold - 1024, // 1KB under threshold
+			modifyFn: func(path string) error {
+				// Modify content but keep same size
+				return modifyFileContent(path, "modified")
+			},
+			want: false, // Should detect difference via hash
 		},
 		{
-			name:     "just over threshold",
-			size:     hashThreshold + 1024, // 1KB over threshold
-			modify:   true,
-			wantHash: false, // Should skip hash check
+			name: "just over threshold",
+			size: hashThreshold + 1024, // 1KB over threshold
+			modifyFn: func(path string) error {
+				// Modify content AND timestamp
+				if err := modifyFileContent(path, "modified"); err != nil {
+					return err
+				}
+				newTime := time.Now().Add(time.Hour)
+				return os.Chtimes(path, newTime, newTime)
+			},
+			want: false, // Should detect difference via timestamp
 		},
 		{
-			name:     "large video file simulation",
+			name: "large file different size",
+			size: 200 * 1024 * 1024, // 200MB
+			modifyFn: func(path string) error {
+				// Truncate file to change size
+				return os.Truncate(path, 100*1024*1024)
+			},
+			want: false, // Should detect difference via size
+		},
+		{
+			name:     "large file same attributes",
 			size:     200 * 1024 * 1024, // 200MB
-			modify:   true,
-			wantHash: false, // Should skip hash check
+			modifyFn: nil,               // Don't modify the file
+			want:     true,              // Should consider equal
 		},
 	}
 
@@ -1015,16 +1034,10 @@ func TestLargeFileHandling(t *testing.T) {
 			}
 
 			// Test IsFileEqual behavior
-			if tt.modify {
-				// Modify a byte in the middle of the file
-				f, err := os.OpenFile(extractedPath, os.O_RDWR, 0644)
+			if tt.modifyFn != nil {
+				err := tt.modifyFn(extractedPath)
 				if err != nil {
-					t.Fatal(err)
-				}
-				_, err = f.WriteAt([]byte("modified"), tt.size/2)
-				f.Close()
-				if err != nil {
-					t.Fatal(err)
+					t.Fatalf("Failed to modify file: %v", err)
 				}
 			}
 
@@ -1036,17 +1049,21 @@ func TestLargeFileHandling(t *testing.T) {
 			defer r.Close()
 
 			equal, _ := IsFileEqual(r.File[0], extractedPath) // Add _, to ignore reason
-			if tt.wantHash {
-				if equal {
-					t.Error("Expected files to be different due to modification (with hash check)")
-				}
-			} else {
-				if !equal {
-					t.Error("Expected files to be considered equal (size-only check)")
-				}
+			if equal != tt.want {
+				t.Errorf("IsFileEqual() = %v, want %v", equal, tt.want)
 			}
 		})
 	}
+}
+
+func modifyFileContent(path string, content string) error {
+	f, err := os.OpenFile(path, os.O_RDWR, 0644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	_, err = f.WriteAt([]byte(content), 0)
+	return err
 }
 
 func TestExtractionLogging(t *testing.T) {

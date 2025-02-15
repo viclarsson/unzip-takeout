@@ -52,6 +52,7 @@ type ZipExtractor struct {
 	destFolder string
 	basePath   string
 	logs       []ExtractionLog
+	logsMutex  sync.Mutex // Add mutex for logs
 }
 
 func NewZipExtractor(workers int, autoMode bool, dryRun bool, destFolder string, basePath string) *ZipExtractor {
@@ -119,23 +120,29 @@ func IsFileEqual(f *zip.File, destPath string) (bool, string) {
 		return false, fmt.Sprintf("error accessing file: %v", err)
 	}
 
+	// Always check size first
 	if destInfo.Size != int64(f.UncompressedSize64) {
 		return false, fmt.Sprintf("size mismatch: zip=%d, existing=%d", f.UncompressedSize64, destInfo.Size)
 	}
 
+	// Always check modification time
 	timeDiff := destInfo.ModTime.Sub(f.Modified).Abs()
 	if timeDiff > 2*time.Second {
 		return false, fmt.Sprintf("time mismatch: zip=%v, existing=%v", f.Modified, destInfo.ModTime)
 	}
 
-	if destInfo.Size < hashThreshold {
-		equal, err := compareFileHash(f, destPath)
-		if err != nil {
-			return false, fmt.Sprintf("hash comparison error: %v", err)
-		}
-		if !equal {
-			return false, "content mismatch (different hash)"
-		}
+	// For large files (>= hashThreshold), skip content comparison
+	if int64(f.UncompressedSize64) >= hashThreshold {
+		return true, ""
+	}
+
+	// For smaller files, also compare content hash
+	equal, err := compareFileHash(f, destPath)
+	if err != nil {
+		return false, fmt.Sprintf("hash comparison error: %v", err)
+	}
+	if !equal {
+		return false, "content mismatch (different hash)"
 	}
 
 	return true, ""
@@ -296,6 +303,8 @@ func (z *ZipExtractor) Unzip(zipPath string) error {
 }
 
 func (z *ZipExtractor) logExtraction(path, destPath string, size int64, status, reason string) {
+	z.logsMutex.Lock()
+	defer z.logsMutex.Unlock()
 	z.logs = append(z.logs, ExtractionLog{
 		Path:      path,
 		DestPath:  destPath,
@@ -308,7 +317,12 @@ func (z *ZipExtractor) logExtraction(path, destPath string, size int64, status, 
 }
 
 func (z *ZipExtractor) GetLogs() []ExtractionLog {
-	return z.logs
+	z.logsMutex.Lock()
+	defer z.logsMutex.Unlock()
+	// Return a copy to prevent external modifications
+	logsCopy := make([]ExtractionLog, len(z.logs))
+	copy(logsCopy, z.logs)
+	return logsCopy
 }
 
 func (z *ZipExtractor) ExtractFile(f *zip.File, destPath string) error {

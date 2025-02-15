@@ -4,7 +4,7 @@ build:
 	go build -o bin/unzip-takeout
 
 test:
-	go test -v ./...
+	go test -v -race ./...
 
 clean:
 	rm -rf bin/
