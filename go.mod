@@ -1,4 +1,4 @@
-module victorlarsson.com/unzip-takeout
+module github.com/viclarsson/unzip-takeout
 
 go 1.22.4
 
