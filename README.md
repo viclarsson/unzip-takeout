@@ -17,9 +17,21 @@ Made for personal use, but could be useful for others, due to the changes in the
 
 ## Installation
 
-```
+### Option 1: Using Go (requires Go installed)
+
+```bash
 go install github.com/viclarsson/unzip-takeout@latest
 ```
+
+Then you can use the `unzip-takeout` command.
+
+```bash
+unzip-takeout --help
+```
+
+### Option 2: Download Binary
+
+Download the pre-compiled binary for your system from the [releases page](https://github.com/viclarsson/unzip-takeout/releases/latest).
 
 ## Basic Usage
 
