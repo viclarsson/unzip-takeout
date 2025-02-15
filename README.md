@@ -4,7 +4,7 @@ A tool to efficiently extract Google Takeout archives to any destination, such a
 
 As Google Takeout only exports files owned by the user, a shared Drive folder will need to be exported by all users contributing to the folder and therefore needs an efficient way to merge the files into a single folder.
 
-Made for personal use, but could be useful for others.
+Made for personal use, but could be useful for others, due to the changes in the previously free Google Workspaces where additional storage could be bought. We wanted to migrate files to iCloud and needed a simple way to export all users' files and merge them efficiently.
 
 ## Features
 
