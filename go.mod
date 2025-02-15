@@ -1,4 +1,4 @@
-module victorlarsson.com/takeout-to-icloud
+module victorlarsson.com/unzip-takeout
 
 go 1.22.4
 

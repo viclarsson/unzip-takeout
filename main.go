@@ -426,7 +426,7 @@ func main() {
 	args := flag.Args()
 
 	if len(args) < 2 {
-		fmt.Println("Usage: takeout-to-icloud [flags] <destination_folder> <zip1> <zip2> ... <zipN>")
+		fmt.Println("Usage: unzip-takeout [flags] <destination_folder> <zip1> <zip2> ... <zipN>")
 		fmt.Println("\nFlags must be specified before the destination folder and zip files.")
 		fmt.Println("\nFlags:")
 		fmt.Println("  --workers=N                 Number of parallel extraction workers (default: 4)")
